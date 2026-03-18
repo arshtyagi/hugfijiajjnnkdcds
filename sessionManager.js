@@ -228,17 +228,23 @@ async function _loginAccount(acc) {
         logger.info('Session stored', { accountId: acc.accountId });
 
         // Proactive refresh — 5 min before expiry
+        // Always reset state so a working account gets full attempts on re-login
         const refreshIn = SESSION_TTL_MS - SESSION_REFRESH_BUFFER;
-        setTimeout(() => _proactiveRefresh(acc), refreshIn).unref();
+        setTimeout(() => {
+          logger.info('Proactive refresh triggered', { accountId: acc.accountId });
+          failureCounts.delete(acc.accountId);
+          stoppedAccounts.delete(acc.accountId);
+          _loginWithRetry(acc);
+        }, refreshIn).unref();
 
         // Hard re-login guarantee — fires at exact TTL even if proactive refresh missed
         setTimeout(() => {
           const current = sessions.get(acc.accountId);
-          // Only re-login if this is still the same session (not already refreshed)
           if (current && current.createdAt === session.createdAt) {
             logger.info('Session TTL reached — forcing re-login', { accountId: acc.accountId });
             sessions.delete(acc.accountId);
             failureCounts.delete(acc.accountId);
+            stoppedAccounts.delete(acc.accountId);
             _loginWithRetry(acc);
           }
         }, SESSION_TTL_MS).unref();
@@ -258,34 +264,27 @@ async function _loginAccount(acc) {
   return promise;
 }
 
-async function _proactiveRefresh(acc) {
-  const session = sessions.get(acc.accountId);
-  if (!session || !_isNearExpiry(session)) return;
-  logger.info('Proactive session refresh', { accountId: acc.accountId });
-  failureCounts.delete(acc.accountId);
-  stoppedAccounts.delete(acc.accountId);
-  _loginWithRetry(acc);
-}
 
 async function _healthCheck() {
   const now = Date.now();
   for (const acc of accounts) {
-    if (stoppedAccounts.has(acc.accountId)) continue;
-
-    // Don't touch accounts that haven't reached their scheduled login time yet
     const loginAt = scheduledAt.get(acc.accountId) || 0;
     if (now < loginAt) continue;
 
     const s = sessions.get(acc.accountId);
 
+    // Near-expiry — refresh before it dies
     if (s && _isNearExpiry(s) && !loginInProgress.has(acc.accountId)) {
       logger.info('Health check: refreshing near-expiry session', { accountId: acc.accountId });
       failureCounts.delete(acc.accountId);
+      stoppedAccounts.delete(acc.accountId);
       _loginWithRetry(acc);
+      continue;
     }
 
-    if (!s && !loginInProgress.has(acc.accountId)) {
-      logger.warn('Health check: no session — triggering login', { accountId: acc.accountId });
+    // Session fully expired or missing — always retry regardless of stopped state
+    if (!s && !_isAlive(s ?? {}) && !loginInProgress.has(acc.accountId)) {
+      logger.warn('Health check: session missing/expired — re-login', { accountId: acc.accountId });
       failureCounts.delete(acc.accountId);
       stoppedAccounts.delete(acc.accountId);
       _loginWithRetry(acc);
