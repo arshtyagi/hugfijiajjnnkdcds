@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apollo API Tester</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0a0a0f;
+      --surface:    #111118;
+      --surface2:   #1a1a24;
+      --border:     #2a2a3a;
+      --accent:     #6c63ff;
+      --accent2:    #00d4aa;
+      --danger:     #ff4757;
+      --warn:       #ffa502;
+      --text:       #e8e8f0;
+      --muted:      #666680;
+      --mono:       'JetBrains Mono', monospace;
+      --sans:       'Syne', sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    /* ── Grid noise texture ── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 20% 0%, rgba(108,99,255,.08) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(0,212,170,.06) 0%, transparent 60%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .app {
+      position: relative;
+      z-index: 1;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 24px 80px;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 40px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      font-size: 18px;
+    }
+
+    .logo-text {
+      font-family: var(--sans);
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-text span { color: var(--accent); }
+
+    .server-url {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+
+    .server-url input {
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--accent2);
+      font-family: var(--mono);
+      font-size: 12px;
+      width: 200px;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background .3s;
+    }
+    .dot.alive  { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+    .dot.dead   { background: var(--danger); }
+
+    /* ── Layout ── */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+    }
+
+    .card-title {
+      font-family: var(--sans);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .method-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+      letter-spacing: 1px;
+    }
+    .method-post { background: rgba(108,99,255,.2); color: var(--accent); border: 1px solid rgba(108,99,255,.3); }
+    .method-get  { background: rgba(0,212,170,.2);  color: var(--accent2); border: 1px solid rgba(0,212,170,.3); }
+
+    .card-body { padding: 18px; }
+
+    /* ── Form elements ── */
+    label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      letter-spacing: .5px;
+    }
+
+    textarea, input[type="text"] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 10px 12px;
+      resize: vertical;
+      outline: none;
+      transition: border-color .2s;
+    }
+    textarea:focus, input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+    textarea { min-height: 80px; }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all .2s;
+      letter-spacing: .3px;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover  { background: #7c74ff; transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+    .btn-secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+    .btn-sm { padding: 6px 12px; font-size: 11px; }
+
+    /* ── Response panel ── */
+    .response-wrap {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 100px;
+      position: relative;
+      overflow: auto;
+      max-height: 320px;
+    }
+
+    .response-wrap pre {
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .placeholder {
+      color: var(--muted);
+      font-size: 12px;
+      font-style: italic;
+    }
+
+    /* ── Status pill ── */
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-weight: 500;
+    }
+    .status-ok      { background: rgba(0,212,170,.15); color: var(--accent2); border: 1px solid rgba(0,212,170,.25); }
+    .status-error   { background: rgba(255,71,87,.15);  color: var(--danger);  border: 1px solid rgba(255,71,87,.25); }
+    .status-loading { background: rgba(108,99,255,.15); color: var(--accent);  border: 1px solid rgba(108,99,255,.25); }
+
+    /* ── Lead count display ── */
+    .lead-count {
+      text-align: center;
+      padding: 28px 0 16px;
+    }
+
+    .count-number {
+      font-family: var(--sans);
+      font-size: 56px;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1;
+      letter-spacing: -2px;
+      animation: countIn .4s cubic-bezier(.34,1.56,.64,1);
+    }
+
+    @keyframes countIn {
+      from { transform: scale(.7); opacity: 0; }
+      to   { transform: scale(1);  opacity: 1; }
+    }
+
+    .count-label {
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-top: 6px;
+    }
+
+    /* ── Session table ── */
+    .session-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    .session-table th {
+      text-align: left;
+      padding: 8px 10px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      font-weight: 400;
+    }
+
+    .session-table td {
+      padding: 10px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.04);
+      vertical-align: middle;
+    }
+
+    .session-table tr:last-child td { border-bottom: none; }
+
+    .ttl-bar {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      width: 80px;
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 8px;
+    }
+
+    .ttl-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 2px;
+      transition: width .5s;
+    }
+
+    /* ── URL history ── */
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background .15s;
+      font-size: 11px;
+    }
+    .history-item:hover { background: var(--surface2); }
+    .history-item .url-text {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+    }
+    .history-item:hover .url-text { color: var(--text); }
+    .history-result { color: var(--accent2); font-weight: 600; white-space: nowrap; }
+
+    /* ── Latency ── */
+    .latency { font-size: 11px; color: var(--muted); }
+    .latency span { color: var(--accent2); }
+
+    /* ── Spinner ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(108,99,255,.3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: inline-block;
+    }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 12px;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all .3s;
+      z-index: 999;
+      pointer-events: none;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+
+    .row { display: flex; gap: 10px; align-items: flex-end; }
+    .row > * { flex: 1; }
+    .row .btn { flex: 0 0 auto; margin-bottom: 0; }
+
+    .full { grid-column: 1 / -1; }
+
+    .mt { margin-top: 12px; }
+    .mb { margin-bottom: 12px; }
+
+    .flex-between { display: flex; align-items: center; justify-content: space-between; }
+    .gap { gap: 8px; display: flex; align-items: center; }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+      <div class="logo-text">Apollo <span>API</span> Tester</div>
+    </div>
+    <div class="server-url">
+      <div class="dot" id="serverDot"></div>
+      <input type="text" id="serverInput" value="http://localhost:3000" placeholder="http://localhost:3000" />
+      <button class="btn btn-secondary btn-sm" onclick="checkHealth()">ping</button>
+    </div>
+  </header>
+
+  <div class="grid">
+
+    <!-- Lead Count -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Lead Count</span>
+        <span class="method-badge method-post">POST /leads/count</span>
+      </div>
+      <div class="card-body">
+        <label>Apollo Search URL</label>
+        <div class="row mb">
+          <textarea id="apolloUrl" rows="3" placeholder="https://app.apollo.io/#/people?personTitles[]=CEO&personLocations[]=United%20States"></textarea>
+        </div>
+        <div class="flex-between">
+          <div class="gap">
+            <button class="btn btn-primary" id="countBtn" onclick="getLeadCount()">
+              <span>Run Query</span>
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="clearCount()">Clear</button>
+          </div>
+          <span class="latency" id="countLatency"></span>
+        </div>
+
+        <div id="countResult" style="margin-top:16px; display:none;">
+          <div class="lead-count">
+            <div class="count-number" id="countNumber">—</div>
+            <div class="count-label">matching leads</div>
+          </div>
+        </div>
+        <div id="countError" style="margin-top:12px; display:none;">
+          <div class="response-wrap">
+            <pre id="countErrorText" style="color: #ff4757;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Health / Sessions -->
+    <div class="card">
+      <div class="card-header">
+        <div class="flex-between" style="width:100%">
+          <span class="card-title">Session Health</span>
+          <div class="gap">
+            <span id="healthStatus"></span>
+            <span class="method-badge method-get">GET /health</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div id="sessionTable">
+          <div class="placeholder">Click refresh to load session status.</div>
+        </div>
+        <div class="mt flex-between">
+          <button class="btn btn-secondary btn-sm" onclick="checkHealth()">↻ Refresh</button>
+          <span class="latency" id="healthLatency"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- URL History -->
+    <div class="card full">
+      <div class="card-header">
+        <span class="card-title">Query History</span>
+        <button class="btn btn-secondary btn-sm" onclick="clearHistory()">Clear</button>
+      </div>
+      <div class="card-body" id="historyList">
+        <div class="placeholder">Your query history will appear here.</div>
+      </div>
+    </div>
+
+    <!-- Raw Response -->
+    <div class="card full">
+      <div class="card-header">
+        <div class="flex-between" style="width:100%">
+          <span class="card-title">Raw Response</span>
+          <button class="btn btn-secondary btn-sm" onclick="copyRaw()">Copy</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="response-wrap">
+          <pre id="rawResponse"><span class="placeholder">Response will appear here...</span></pre>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  const SESSION_TTL = 3_600_000;
+  let history = JSON.parse(localStorage.getItem('apollo_history') || '[]');
+
+  function server() {
+    return document.getElementById('serverInput').value.replace(/\/$/, '');
+  }
+
+  // ── Lead Count ────────────────────────────────────────────────────────────
+
+  async function getLeadCount() {
+    const url = document.getElementById('apolloUrl').value.trim();
+    if (!url) { toast('Paste an Apollo URL first'); return; }
+
+    const btn = document.getElementById('countBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span><span>Running...</span>';
+
+    document.getElementById('countResult').style.display = 'none';
+    document.getElementById('countError').style.display  = 'none';
+    document.getElementById('countLatency').textContent  = '';
+    setRaw('');
+
+    const t0 = Date.now();
+    try {
+      const res  = await fetch(`${server()}/leads/count`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ apollo_url: url }),
+      });
+      const ms   = Date.now() - t0;
+      const data = await res.json();
+      setRaw(data);
+      document.getElementById('countLatency').innerHTML = `<span>${ms}ms</span>`;
+
+      if (res.ok && data.lead_count !== undefined) {
+        document.getElementById('countNumber').textContent = data.lead_count.toLocaleString();
+        document.getElementById('countResult').style.display = 'block';
+        addHistory(url, data.lead_count);
+      } else {
+        document.getElementById('countErrorText').textContent = data.error || data.detail || JSON.stringify(data);
+        document.getElementById('countError').style.display = 'block';
+      }
+    } catch (e) {
+      const ms = Date.now() - t0;
+      document.getElementById('countLatency').innerHTML = `<span>${ms}ms</span>`;
+      document.getElementById('countErrorText').textContent = `Network error: ${e.message}`;
+      document.getElementById('countError').style.display = 'block';
+      setRaw({ error: e.message });
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<span>Run Query</span>';
+    }
+  }
+
+  function clearCount() {
+    document.getElementById('apolloUrl').value = '';
+    document.getElementById('countResult').style.display = 'none';
+    document.getElementById('countError').style.display  = 'none';
+    document.getElementById('countLatency').textContent  = '';
+    setRaw('');
+  }
+
+  // ── Health ─────────────────────────────────────────────────────────────────
+
+  async function checkHealth() {
+    const dot = document.getElementById('serverDot');
+    const t0  = Date.now();
+
+    try {
+      const res  = await fetch(`${server()}/health`);
+      const ms   = Date.now() - t0;
+      const data = await res.json();
+
+      dot.className = 'dot ' + (res.ok ? 'alive' : 'dead');
+      document.getElementById('healthLatency').innerHTML = `<span>${ms}ms</span>`;
+
+      const pill = res.ok
+        ? `<span class="status-pill status-ok">● ${data.status} — uptime ${fmt(data.uptime)}</span>`
+        : `<span class="status-pill status-error">● degraded</span>`;
+      document.getElementById('healthStatus').innerHTML = pill;
+
+      renderSessions(data.sessions || []);
+      setRaw(data);
+    } catch (e) {
+      dot.className = 'dot dead';
+      document.getElementById('healthStatus').innerHTML = `<span class="status-pill status-error">● unreachable</span>`;
+      document.getElementById('sessionTable').innerHTML = `<div class="placeholder" style="color:var(--danger)">Cannot reach server: ${e.message}</div>`;
+      setRaw({ error: e.message });
+    }
+  }
+
+  function renderSessions(sessions) {
+    if (!sessions.length) {
+      document.getElementById('sessionTable').innerHTML = '<div class="placeholder">No sessions found.</div>';
+      return;
+    }
+
+    const rows = sessions.map(s => {
+      const pct   = s.ttlMs / SESSION_TTL * 100;
+      const ttlSec = Math.floor(s.ttlMs / 1000);
+      const ttlFmt = ttlSec > 60 ? `${Math.floor(ttlSec/60)}m ${ttlSec%60}s` : `${ttlSec}s`;
+
+      const statusColor = s.status === 'alive' ? 'var(--accent2)' : s.status === 'none' ? 'var(--muted)' : 'var(--danger)';
+      const loginIcon   = s.loginInProgress ? '<span class="spinner"></span>' : '';
+
+      return `<tr>
+        <td style="color:var(--accent);font-weight:500">${s.accountId}</td>
+        <td style="color:var(--muted);font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.proxy}</td>
+        <td><span style="color:${statusColor}">● ${s.status}</span> ${loginIcon}</td>
+        <td>
+          ${s.status === 'alive' ? ttlFmt : '—'}
+          ${s.status === 'alive' ? `<span class="ttl-bar"><span class="ttl-fill" style="width:${pct}%"></span></span>` : ''}
+        </td>
+      </tr>`;
+    }).join('');
+
+    document.getElementById('sessionTable').innerHTML = `
+      <table class="session-table">
+        <thead><tr>
+          <th>Account</th><th>Proxy</th><th>Status</th><th>TTL</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  // ── History ────────────────────────────────────────────────────────────────
+
+  function addHistory(url, count) {
+    history.unshift({ url, count, ts: Date.now() });
+    if (history.length > 20) history = history.slice(0, 20);
+    localStorage.setItem('apollo_history', JSON.stringify(history));
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const el = document.getElementById('historyList');
+    if (!history.length) {
+      el.innerHTML = '<div class="placeholder">Your query history will appear here.</div>';
+      return;
+    }
+    el.innerHTML = history.map((h, i) => `
+      <div class="history-item" onclick="loadUrl(${i})">
+        <span style="color:var(--muted);font-size:10px;white-space:nowrap">${timeAgo(h.ts)}</span>
+        <span class="url-text">${h.url}</span>
+        <span class="history-result">${h.count.toLocaleString()}</span>
+      </div>`).join('');
+  }
+
+  function loadUrl(i) {
+    document.getElementById('apolloUrl').value = history[i].url;
+    toast('URL loaded — click Run Query');
+  }
+
+  function clearHistory() {
+    history = [];
+    localStorage.removeItem('apollo_history');
+    renderHistory();
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function setRaw(data) {
+    const el = document.getElementById('rawResponse');
+    if (!data && data !== 0) {
+      el.innerHTML = '<span class="placeholder">Response will appear here...</span>';
+      return;
+    }
+    const str = JSON.stringify(data, null, 2);
+    el.textContent = str;
+  }
+
+  function copyRaw() {
+    const text = document.getElementById('rawResponse').textContent;
+    navigator.clipboard.writeText(text).then(() => toast('Copied to clipboard'));
+  }
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 2500);
+  }
+
+  function fmt(sec) {
+    if (sec < 60)   return `${sec}s`;
+    if (sec < 3600) return `${Math.floor(sec/60)}m`;
+    return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
+  }
+
+  function timeAgo(ts) {
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60)   return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    return `${Math.floor(s/3600)}h ago`;
+  }
+
+  // Submit on Ctrl+Enter in textarea
+  document.getElementById('apolloUrl').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) getLeadCount();
+  });
+
+  // Init
+  renderHistory();
+  checkHealth();
+
+  // Auto-refresh health every 30s
+  setInterval(checkHealth, 30_000);
+</script>
+</body>
+</html>
