@@ -3,17 +3,10 @@
 /**
  * imapOtp.js
  *
- * Fetches OTP codes from Gmail via IMAP.
- *
- * Email disposal (controlled by IMAP_ACTION env var):
- *   archive  (default) — move to [Gmail]/All Mail
- *   delete             — move to [Gmail]/Trash  (Gmail empties trash after 30 days)
- *   trash              — alias for delete
- *
- * In addition to disposing the OTP email we just used, we also clean up
- * any OTHER old Apollo OTP emails sitting in the inbox that are older than
- * IMAP_CLEANUP_AFTER_MS (default 10 minutes). This prevents inbox buildup
- * from staggered account logins.
+ * CRITICAL FIX: cleanup is now completely fire-and-forget.
+ * The OTP is returned immediately after being found — the inbox
+ * cleanup happens in the background on a separate IMAP connection
+ * so it never delays the verify_email call.
  */
 
 const { ImapFlow } = require('imapflow');
@@ -32,8 +25,8 @@ const IMAP_CONFIG = {
 };
 
 // 'archive' | 'delete' | 'trash'
-const IMAP_ACTION         = (process.env.IMAP_ACTION || 'archive').toLowerCase();
-const CLEANUP_AFTER_MS    = Number(process.env.IMAP_CLEANUP_AFTER_MS) || 10 * 60 * 1000; // 10 min
+const IMAP_ACTION      = (process.env.IMAP_ACTION || 'archive').toLowerCase();
+const CLEANUP_AFTER_MS = Number(process.env.IMAP_CLEANUP_AFTER_MS) || 10 * 60 * 1000;
 
 const ARCHIVE_FOLDER = '[Gmail]/All Mail';
 const TRASH_FOLDER   = '[Gmail]/Trash';
@@ -52,22 +45,13 @@ function extractOtp(text) {
   return null;
 }
 
-// Global UID dedup — once a UID is consumed it is never returned again
+// Global UID dedup
 const _usedUids = new Set();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Poll until a fresh OTP email arrives, then dispose it.
- * Also cleans up stale Apollo emails older than CLEANUP_AFTER_MS.
- *
- * @param {string} apolloEmail   — for logging only
- * @param {Date}   afterDate     — only accept emails received after this time
- * @param {number} timeoutMs
- * @param {number} pollIntervalMs
- */
 async function waitForOtp(apolloEmail, afterDate, timeoutMs = 90_000, pollIntervalMs = 5_000) {
   if (!(afterDate instanceof Date)) {
     afterDate = new Date(Date.now() - 60_000);
@@ -81,10 +65,14 @@ async function waitForOtp(apolloEmail, afterDate, timeoutMs = 90_000, pollInterv
   });
 
   while (Date.now() < deadline) {
-    const otp = await _fetchAndDispose(afterDate);
-    if (otp) {
+    const result = await _fetchOtp(afterDate);
+    if (result) {
       logger.info('OTP received successfully', { apolloEmail });
-      return otp;
+
+      // ── Fire-and-forget cleanup — does NOT block OTP return ──────────────
+      _backgroundCleanup(result.disposeUids).catch(() => {});
+
+      return result.otp;
     }
     await new Promise(r => setTimeout(r, pollIntervalMs));
   }
@@ -93,17 +81,16 @@ async function waitForOtp(apolloEmail, afterDate, timeoutMs = 90_000, pollInterv
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Internal
+//  Fetch OTP — returns immediately once found, collects UIDs to dispose
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function _fetchAndDispose(afterDate) {
+async function _fetchOtp(afterDate) {
   const client = new ImapFlow(IMAP_CONFIG);
 
   try {
     await client.connect();
     await client.mailboxOpen('INBOX');
 
-    // ── Find all Apollo-related emails since afterDate ──────────────────────
     const uids = await client.search({
       since: afterDate,
       or: [
@@ -114,72 +101,70 @@ async function _fetchAndDispose(afterDate) {
       ],
     });
 
-    if (!uids?.length) {
-      // Even if nothing new arrived, clean up old stale Apollo emails
-      await _cleanupOldEmails(client);
-      return null;
-    }
+    if (!uids?.length) return null;
 
-    // Newest first, skip already-consumed UIDs
     const candidates = [...uids]
       .sort((a, b) => b - a)
       .filter(uid => !_usedUids.has(uid));
 
-    let foundOtp = null;
-    const toDispose = [];
+    if (!candidates.length) return null;
 
     for (const uid of candidates.slice(0, 10)) {
       try {
-        const msg = await client.fetchOne(uid, { envelope: true, source: true });
+        const msg = await client.fetchOne(uid, { source: true });
         if (!msg) continue;
 
         const rawBody = msg.source?.toString('utf8') ?? '';
+        const otp     = extractOtp(rawBody);
+        if (!otp) continue;
 
-        if (!foundOtp) {
-          const otp = extractOtp(rawBody);
-          if (otp) {
-            // Mark consumed immediately
-            _usedUids.add(uid);
-            foundOtp = otp;
-            toDispose.push(uid);
-            logger.info(`OTP email found — will ${IMAP_ACTION}`, { uid });
-            // Don't break — collect other stale emails to dispose too
-          }
-        } else {
-          // Additional Apollo emails we found — dispose them as well
-          toDispose.push(uid);
-        }
+        // Mark consumed immediately
+        _usedUids.add(uid);
+        logger.info(`OTP found (uid ${uid}) — cleanup scheduled in background`);
+
+        // Collect other Apollo emails to clean up too (already filtered by afterDate)
+        const disposeUids = candidates.filter(u => u !== uid).slice(0, 50);
+        disposeUids.unshift(uid); // OTP email first
+
+        return { otp, disposeUids };
+
       } catch (err) {
         logger.warn('Error reading email', { uid, err: err.message });
       }
     }
 
-    // Dispose all collected UIDs in one batch
-    if (toDispose.length) {
-      await _disposeUids(client, toDispose);
-    }
-
-    // Clean up any older stale emails while we have the connection open
-    await _cleanupOldEmails(client);
-
-    return foundOtp;
-
+    return null;
   } catch (err) {
-    logger.error('IMAP error', { message: err.message });
+    logger.error('IMAP fetch error', { message: err.message });
     return null;
   } finally {
     try { await client.logout(); } catch { /* ignore */ }
   }
 }
 
-/**
- * Find Apollo emails older than CLEANUP_AFTER_MS and dispose them.
- * This handles inbox buildup from parallel account logins.
- */
-async function _cleanupOldEmails(client) {
-  try {
-    const cutoff = new Date(Date.now() - CLEANUP_AFTER_MS);
+// ─────────────────────────────────────────────────────────────────────────────
+//  Background cleanup — runs on a fresh connection, never blocks the caller
+// ─────────────────────────────────────────────────────────────────────────────
 
+async function _backgroundCleanup(hotUids = []) {
+  // Small delay so the verify_email request has time to complete first
+  await new Promise(r => setTimeout(r, 3000));
+
+  const client = new ImapFlow(IMAP_CONFIG);
+
+  try {
+    await client.connect();
+    await client.mailboxOpen('INBOX');
+
+    // 1. Dispose the hot UIDs (OTP email + sibling emails from the same poll)
+    const freshHot = hotUids.filter(uid => !_usedUids.has(uid) || hotUids[0] === uid);
+    if (freshHot.length) {
+      freshHot.forEach(uid => _usedUids.add(uid));
+      await _disposeUids(client, freshHot);
+    }
+
+    // 2. Clean up old Apollo emails (older than CLEANUP_AFTER_MS)
+    const cutoff = new Date(Date.now() - CLEANUP_AFTER_MS);
     const oldUids = await client.search({
       before: cutoff,
       or: [
@@ -190,42 +175,35 @@ async function _cleanupOldEmails(client) {
       ],
     });
 
-    if (!oldUids?.length) return;
-
-    // Filter out already-disposed UIDs
-    const toClean = oldUids.filter(uid => !_usedUids.has(uid));
-    if (!toClean.length) return;
-
-    logger.info(`Cleaning up ${toClean.length} old Apollo email(s)`, { action: IMAP_ACTION });
-    toClean.forEach(uid => _usedUids.add(uid));
-    await _disposeUids(client, toClean);
+    if (oldUids?.length) {
+      const toClean = oldUids.filter(uid => !_usedUids.has(uid));
+      if (toClean.length) {
+        logger.info(`Background cleanup: disposing ${toClean.length} old email(s)`);
+        toClean.forEach(uid => _usedUids.add(uid));
+        // Process in batches of 200 to avoid huge IMAP commands
+        for (let i = 0; i < toClean.length; i += 200) {
+          await _disposeUids(client, toClean.slice(i, i + 200));
+        }
+      }
+    }
 
   } catch (err) {
-    logger.warn('Cleanup error (non-fatal)', { err: err.message });
+    logger.warn('Background cleanup error (non-fatal)', { err: err.message });
+  } finally {
+    try { await client.logout(); } catch { /* ignore */ }
   }
 }
 
-/**
- * Move UIDs to archive or trash based on IMAP_ACTION.
- */
 async function _disposeUids(client, uids) {
   if (!uids.length) return;
-
-  const destination = (IMAP_ACTION === 'delete' || IMAP_ACTION === 'trash')
+  const dest = (IMAP_ACTION === 'delete' || IMAP_ACTION === 'trash')
     ? TRASH_FOLDER
     : ARCHIVE_FOLDER;
-
   try {
-    await client.messageMove(uids, destination);
-    logger.info(`Moved ${uids.length} email(s) → ${destination}`, { uids });
-  } catch (err) {
-    // Fallback: mark as read if move fails (e.g. folder name differs)
-    logger.warn(`messageMove failed — marking as read instead`, { err: err.message, destination });
-    try {
-      await client.messageFlagsAdd(uids, ['\\Seen']);
-    } catch (e2) {
-      logger.warn('messageFlagsAdd also failed', { err: e2.message });
-    }
+    await client.messageMove(uids, dest);
+    logger.info(`Moved ${uids.length} email(s) → ${dest}`);
+  } catch {
+    try { await client.messageFlagsAdd(uids, ['\\Seen']); } catch { /* ignore */ }
   }
 }
 
