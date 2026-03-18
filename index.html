@@ -420,7 +420,7 @@
     </div>
     <div class="server-url">
       <div class="dot" id="serverDot"></div>
-      <input type="text" id="serverInput" value="https://check.leadus.in" placeholder="https://check.leadus.in" />
+      <input type="text" id="serverInput" value="" placeholder="http://localhost:3000" />
       <button class="btn btn-secondary btn-sm" onclick="checkHealth()">ping</button>
     </div>
   </header>
@@ -618,13 +618,20 @@
       const ttlSec = Math.floor(s.ttlMs / 1000);
       const ttlFmt = ttlSec > 60 ? `${Math.floor(ttlSec/60)}m ${ttlSec%60}s` : `${ttlSec}s`;
 
-      const statusColor = s.status === 'alive' ? 'var(--accent2)' : s.status === 'none' ? 'var(--muted)' : 'var(--danger)';
+      const statusColor = s.status === 'alive'      ? 'var(--accent2)'
+                        : s.status === 'scheduled'  ? 'var(--warn)'
+                        : s.status === 'stopped'    ? 'var(--danger)'
+                        : 'var(--muted)';
+
+      const statusLabel = s.status === 'scheduled'
+        ? `● scheduled in ${fmt(Math.ceil(s.scheduledInMs / 1000))}`
+        : `● ${s.status}`;
       const loginIcon   = s.loginInProgress ? '<span class="spinner"></span>' : '';
 
       return `<tr>
         <td style="color:var(--accent);font-weight:500">${s.accountId}</td>
         <td style="color:var(--muted);font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.proxy}</td>
-        <td><span style="color:${statusColor}">● ${s.status}</span> ${loginIcon}</td>
+        <td><span style="color:${statusColor}">${statusLabel}</span> ${loginIcon}</td>
         <td>
           ${s.status === 'alive' ? ttlFmt : '—'}
           ${s.status === 'alive' ? `<span class="ttl-bar"><span class="ttl-fill" style="width:${pct}%"></span></span>` : ''}
@@ -718,6 +725,7 @@
   });
 
   // Init
+  document.getElementById('serverInput').value = window.location.origin;
   renderHistory();
   checkHealth();
 
