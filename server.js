@@ -9,13 +9,11 @@ const { getLeadCount } = require('./apolloSearch');
 const logger         = require('./utils/logger');
 const fs             = require('fs');
 
-// Ensure logs directory exists
 if (!fs.existsSync('logs')) fs.mkdirSync('logs');
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -45,6 +43,28 @@ app.use((req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Routes
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /
+ * Root — returns service info so visiting the URL in a browser works.
+ */
+app.get('/', (req, res) => {
+  const metrics = sessionManager.getMetrics();
+  const alive   = metrics.filter(m => m.status === 'alive').length;
+  const stopped = metrics.filter(m => m.status === 'stopped').length;
+  res.json({
+    service:  'Apollo API',
+    version:  '1.0.0',
+    status:   alive > 0 ? 'ok' : 'degraded',
+    sessions: { total: metrics.length, alive, stopped },
+    uptime:   Math.floor(process.uptime()),
+    endpoints: {
+      'POST /leads/count': 'Get lead count for an Apollo search URL',
+      'GET  /health':      'Session pool health metrics',
+      'GET  /sessions':    'Session details',
+    },
+  });
+});
 
 /**
  * POST /leads/count
