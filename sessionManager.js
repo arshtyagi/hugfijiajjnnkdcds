@@ -3,7 +3,21 @@
 /**
  * sessionManager.js
  *
- * Login retry policy:
+ * Session overlap strategy (always-alive design):
+ * ─────────────────────────────────────────────────
+ *  SESSION_TTL_MS         = 60 min  (Apollo session lifetime)
+ *  SESSION_REFRESH_BUFFER = 30 min  (re-login when 30 min of session remain)
+ *  LOGIN_STAGGER_INTERVAL = 30 min  (each account 30 min after previous)
+ *
+ *  Timeline with 4 accounts:
+ *    Acct 1:  0:00→1:00  re-login at 0:30
+ *    Acct 2:  0:30→1:30  re-login at 1:00
+ *    Acct 3:  1:00→2:00  re-login at 1:30
+ *    Acct 4:  1:30→2:30  re-login at 2:00
+ *
+ *  Accounts overlap by 30 min — never a gap in coverage.
+ *
+ * Retry policy:
  *   - 3 attempts per login call (5s, 10s backoff between)
  *   - If all fail, wait RETRY_AFTER_FAILURE_MS (default 30 min) then try once more
  *   - After MAX_TOTAL_LOGIN_ATTEMPTS total failures, STOP — log a fatal error
@@ -15,8 +29,8 @@ const logger            = require('./utils/logger');
 const { sleep }         = require('./utils/httpClient');
 
 const SESSION_TTL_MS         = Number(process.env.SESSION_TTL_MS)                || 3_600_000;  // 1 h
-const SESSION_REFRESH_BUFFER = Number(process.env.SESSION_REFRESH_BUFFER_MS)     || 300_000;    // 5 min
-const LOGIN_STAGGER_INTERVAL = Number(process.env.LOGIN_STAGGER_INTERVAL_MS)     || 1_200_000;  // 20 min
+const SESSION_REFRESH_BUFFER = Number(process.env.SESSION_REFRESH_BUFFER_MS)     || 1_800_000;  // 30 min — re-login at halfway point
+const LOGIN_STAGGER_INTERVAL = Number(process.env.LOGIN_STAGGER_INTERVAL_MS)     || 1_800_000;  // 30 min — matches refresh buffer for perfect overlap
 const HEALTH_CHECK_INTERVAL  = 60_000;
 
 // After all attempts fail, wait this long before one more try
@@ -44,6 +58,7 @@ const sessions        = new Map();
 const loginInProgress = new Map();
 const failureCounts   = new Map(); // accountId → total failed login calls
 const stoppedAccounts = new Set(); // accounts that hit MAX_TOTAL_LOGIN_ATTEMPTS
+const scheduledAt     = new Map(); // accountId → timestamp when login is scheduled to start
 
 let accounts = [];
 let rrIndex  = 0;
@@ -65,9 +80,12 @@ async function init() {
 
   for (let i = 0; i < accounts.length; i++) {
     if (i === 0) {
+      scheduledAt.set(accounts[0].accountId, Date.now());
       _loginWithRetry(accounts[0]);
     } else {
       const delay = i * LOGIN_STAGGER_INTERVAL;
+      const loginAt = Date.now() + delay;
+      scheduledAt.set(accounts[i].accountId, loginAt);
       setTimeout(() => _loginWithRetry(accounts[i]), delay);
       logger.info('Login scheduled', { accountId: accounts[i].accountId, inMinutes: delay / 60_000 });
     }
@@ -95,8 +113,21 @@ async function getValidSession() {
   if (!activeAcc) throw new Error('All accounts have exceeded max login attempts — manual intervention required');
 
   logger.warn('All sessions expired — emergency re-login', { accountId: activeAcc.accountId });
-  const session = await _loginAccount(activeAcc);
-  return _toPublic(session);
+
+  // Use _loginAccount directly here since we need to await the result
+  // _loginWithRetry is fire-and-forget so we can't await it
+  try {
+    const session = await _loginAccount(activeAcc);
+    return _toPublic(session);
+  } catch (err) {
+    const failures = (failureCounts.get(activeAcc.accountId) || 0) + 1;
+    failureCounts.set(activeAcc.accountId, failures);
+    if (failures >= MAX_TOTAL_LOGIN_ATTEMPTS) {
+      stoppedAccounts.add(activeAcc.accountId);
+      logger.error('🚨 ACCOUNT LOGIN STOPPED — max attempts reached', { accountId: activeAcc.accountId });
+    }
+    throw err;
+  }
 }
 
 function invalidateSession(accountId) {
@@ -109,15 +140,18 @@ function invalidateSession(accountId) {
 function getMetrics() {
   const now = Date.now();
   return accounts.map(acc => {
-    const s       = sessions.get(acc.accountId);
-    const ttl     = s ? Math.max(0, SESSION_TTL_MS - (now - s.createdAt)) : 0;
-    const stopped = stoppedAccounts.has(acc.accountId);
+    const s        = sessions.get(acc.accountId);
+    const ttl      = s ? Math.max(0, SESSION_TTL_MS - (now - s.createdAt)) : 0;
+    const stopped  = stoppedAccounts.has(acc.accountId);
     const failures = failureCounts.get(acc.accountId) || 0;
+    const loginAt  = scheduledAt.get(acc.accountId) || 0;
+    const pending  = !stopped && !s && loginAt > now;
     return {
       accountId:       acc.accountId,
       proxy:           acc.proxy ? acc.proxy.replace(/\/\/[^@]*@/, '//***@') : 'direct',
-      status:          stopped ? 'stopped' : s ? (_isAlive(s) ? 'alive' : 'expired') : 'none',
+      status:          stopped ? 'stopped' : pending ? 'scheduled' : s ? (_isAlive(s) ? 'alive' : 'expired') : 'none',
       ttlMs:           ttl,
+      scheduledInMs:   pending ? loginAt - now : 0,
       loginInProgress: loginInProgress.has(acc.accountId),
       totalFailures:   failures,
       maxFailures:     MAX_TOTAL_LOGIN_ATTEMPTS,
@@ -193,8 +227,21 @@ async function _loginAccount(acc) {
         stoppedAccounts.delete(acc.accountId);
         logger.info('Session stored', { accountId: acc.accountId });
 
+        // Proactive refresh — 5 min before expiry
         const refreshIn = SESSION_TTL_MS - SESSION_REFRESH_BUFFER;
         setTimeout(() => _proactiveRefresh(acc), refreshIn).unref();
+
+        // Hard re-login guarantee — fires at exact TTL even if proactive refresh missed
+        setTimeout(() => {
+          const current = sessions.get(acc.accountId);
+          // Only re-login if this is still the same session (not already refreshed)
+          if (current && current.createdAt === session.createdAt) {
+            logger.info('Session TTL reached — forcing re-login', { accountId: acc.accountId });
+            sessions.delete(acc.accountId);
+            failureCounts.delete(acc.accountId);
+            _loginWithRetry(acc);
+          }
+        }, SESSION_TTL_MS).unref();
 
         return session;
       } catch (err) {
@@ -215,14 +262,20 @@ async function _proactiveRefresh(acc) {
   const session = sessions.get(acc.accountId);
   if (!session || !_isNearExpiry(session)) return;
   logger.info('Proactive session refresh', { accountId: acc.accountId });
-  // Reset failure count before proactive refresh so it gets full attempts
   failureCounts.delete(acc.accountId);
+  stoppedAccounts.delete(acc.accountId);
   _loginWithRetry(acc);
 }
 
 async function _healthCheck() {
+  const now = Date.now();
   for (const acc of accounts) {
     if (stoppedAccounts.has(acc.accountId)) continue;
+
+    // Don't touch accounts that haven't reached their scheduled login time yet
+    const loginAt = scheduledAt.get(acc.accountId) || 0;
+    if (now < loginAt) continue;
+
     const s = sessions.get(acc.accountId);
 
     if (s && _isNearExpiry(s) && !loginInProgress.has(acc.accountId)) {
@@ -233,6 +286,8 @@ async function _healthCheck() {
 
     if (!s && !loginInProgress.has(acc.accountId)) {
       logger.warn('Health check: no session — triggering login', { accountId: acc.accountId });
+      failureCounts.delete(acc.accountId);
+      stoppedAccounts.delete(acc.accountId);
       _loginWithRetry(acc);
     }
   }
