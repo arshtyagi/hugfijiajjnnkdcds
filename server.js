@@ -8,6 +8,7 @@ const sessionManager = require('./sessionManager');
 const { getLeadCount } = require('./apolloSearch');
 const logger         = require('./utils/logger');
 const fs             = require('fs');
+const path           = require('path');
 
 if (!fs.existsSync('logs')) fs.mkdirSync('logs');
 
@@ -46,24 +47,10 @@ app.use((req, res, next) => {
 
 /**
  * GET /
- * Root — returns service info so visiting the URL in a browser works.
+ * Serve the test dashboard UI.
  */
 app.get('/', (req, res) => {
-  const metrics = sessionManager.getMetrics();
-  const alive   = metrics.filter(m => m.status === 'alive').length;
-  const stopped = metrics.filter(m => m.status === 'stopped').length;
-  res.json({
-    service:  'Apollo API',
-    version:  '1.0.0',
-    status:   alive > 0 ? 'ok' : 'degraded',
-    sessions: { total: metrics.length, alive, stopped },
-    uptime:   Math.floor(process.uptime()),
-    endpoints: {
-      'POST /leads/count': 'Get lead count for an Apollo search URL',
-      'GET  /health':      'Session pool health metrics',
-      'GET  /sessions':    'Session details',
-    },
-  });
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 /**
