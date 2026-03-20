@@ -91,7 +91,7 @@ async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxR
         }
 
         try {
-          const cfClearance = await solveClearance(proxyUrl);
+          const cfClearance = await solveClearance(proxyUrl, rawBody);
           // Inject cf_clearance into the cookie string for next request
           cookieStr = cookieStr
             ? cookieStr.replace(/cf_clearance=[^;]+;?\s*/g, '') + `; cf_clearance=${cfClearance}`
