@@ -10,7 +10,7 @@
 
 const { Session, ClientIdentifier, initTLS } = require('node-tls-client');
 const { waitForOtp }                          = require('./imapOtp');
-const { solveTurnstile, detectChallenge }     = require('./captchaSolver');
+const { solveTurnstile, solveClearance, detectChallenge } = require('./captchaSolver');
 const logger                                  = require('./utils/logger');
 
 const APOLLO_HOST = process.env.APOLLO_HOST || 'https://app.apollo.io';
@@ -79,21 +79,34 @@ async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxR
 
       const rawBody = resp.body ?? '';
 
-      // Cloudflare challenge detected
+      // Cloudflare JS challenge detected ("Just a moment...")
+      // Need cf_clearance cookie, not a Turnstile token
       if (resp.status === 403 || detectChallenge(rawBody)) {
-        lastChallengeBody = rawBody; // keep for key extraction
+        lastChallengeBody = rawBody;
 
-        if (turnstileToken) {
-          logger.warn('Turnstile token rejected — solving again with fresh key', { attempt });
-          turnstileToken = null;
+        logger.info('Cloudflare JS challenge detected — getting cf_clearance', { attempt });
+
+        if (!proxyUrl) {
+          throw new Error('Cloudflare challenge requires a proxy — cannot solve without one');
         }
 
-        logger.info('Cloudflare challenge detected — solving Turnstile', { attempt });
-
-        // Pass the challenge body so the solver can extract the site key from it
-        turnstileToken = await solveTurnstile(proxyUrl, lastChallengeBody);
-        logger.info('Turnstile solved — retrying request');
-        continue;
+        try {
+          const cfClearance = await solveClearance(proxyUrl);
+          // Inject cf_clearance into the cookie string for next request
+          cookieStr = cookieStr
+            ? cookieStr.replace(/cf_clearance=[^;]+;?\s*/g, '') + `; cf_clearance=${cfClearance}`
+            : `cf_clearance=${cfClearance}`;
+          logger.info('cf_clearance obtained — retrying request');
+          continue;
+        } catch (clearanceErr) {
+          logger.warn('AntiCloudflareTask failed — falling back to Turnstile solve', { err: clearanceErr.message });
+          // Fallback: try Turnstile token approach
+          if (!turnstileToken) {
+            turnstileToken = await solveTurnstile(proxyUrl, lastChallengeBody).catch(() => null);
+            if (turnstileToken) continue;
+          }
+          throw clearanceErr;
+        }
       }
 
       return {
