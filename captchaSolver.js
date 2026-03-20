@@ -119,10 +119,61 @@ async function pollForResult(taskId) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Solve Cloudflare Turnstile.
+ * Solve Cloudflare "Just a moment..." JS challenge to get cf_clearance cookie.
+ * Uses AntiCloudflareTask which handles the full JS challenge.
  *
- * @param {string|null} proxyUrl      — proxy to use for the solve task
- * @param {string|null} challengeBody — the raw challenge response body (used to extract site key)
+ * @param {string|null} proxyUrl — proxy (required for AntiCloudflareTask)
+ * @returns {Promise<string>} cf_clearance cookie value
+ */
+async function solveClearance(proxyUrl = null) {
+  if (!CAPSOLVER_API_KEY) {
+    throw new Error('CAPSOLVER_API_KEY not set — cannot solve Cloudflare challenge');
+  }
+
+  if (!proxyUrl) {
+    throw new Error('Proxy required for AntiCloudflareTask — cannot solve without proxy');
+  }
+
+  let proxyType, proxyAddress, proxyPort, proxyLogin, proxyPassword;
+  try {
+    const u   = new URL(proxyUrl);
+    proxyType     = u.protocol.replace(':', '');
+    proxyAddress  = u.hostname;
+    proxyPort     = Number(u.port);
+    proxyLogin    = u.username ? decodeURIComponent(u.username) : undefined;
+    proxyPassword = u.password ? decodeURIComponent(u.password) : undefined;
+  } catch (err) {
+    throw new Error(`Failed to parse proxy URL: ${err.message}`);
+  }
+
+  logger.info('Solving Cloudflare JS challenge via CapSolver AntiCloudflareTask', {
+    proxyAddress,
+    proxyPort,
+  });
+
+  const task = {
+    type:         'AntiCloudflareTask',
+    websiteURL:   'https://app.apollo.io/api/v1/auth/login',
+    proxy:        `${proxyType}:${proxyLogin}:${proxyPassword}@${proxyAddress}:${proxyPort}`,
+  };
+
+  const taskId = await createTask(task);
+  const result = await pollForResult(taskId);
+
+  // AntiCloudflareTask returns { cf_clearance: "..." } or the token directly
+  const clearance = result?.cf_clearance ?? result;
+  if (!clearance) throw new Error('AntiCloudflareTask returned no cf_clearance');
+
+  logger.info('Cloudflare cf_clearance obtained');
+  return clearance;
+}
+
+/**
+ * Solve Cloudflare Turnstile widget (embedded in Apollo login form).
+ * Only use this when Apollo's own login form shows a Turnstile widget.
+ *
+ * @param {string|null} proxyUrl
+ * @param {string|null} challengeBody
  * @returns {Promise<string>} cfTurnstileResponse token
  */
 async function solveTurnstile(proxyUrl = null, challengeBody = null) {
@@ -130,13 +181,11 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
     throw new Error('CAPSOLVER_API_KEY not set — cannot solve Turnstile');
   }
 
-  // Try to extract key from the challenge body first
   let siteKey = extractSiteKeyFromBody(challengeBody);
 
   if (siteKey) {
     logger.info('Turnstile site key extracted from challenge body', { siteKey });
   } else {
-    // Log what we got so we can improve extraction if needed
     if (challengeBody) {
       logger.info('Could not extract site key from body', {
         bodySnippet: String(challengeBody).slice(0, 200),
@@ -155,7 +204,6 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
     metadata:    { action: 'managed' },
   };
 
-  // Always try proxy-based task when proxy is provided — IP must match
   if (proxyUrl) {
     try {
       const u = new URL(proxyUrl);
@@ -165,17 +213,9 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
       task.proxyPort     = Number(u.port);
       if (u.username) task.proxyLogin    = decodeURIComponent(u.username);
       if (u.password) task.proxyPassword = decodeURIComponent(u.password);
-      logger.info('Using proxy-based Turnstile task', {
-        proxyAddress: task.proxyAddress,
-        proxyPort:    task.proxyPort,
-        hasLogin:     !!task.proxyLogin,
-      });
-    } catch (err) {
-      logger.warn('Failed to parse proxy URL for Turnstile — using ProxyLess (IP mismatch risk)', { err: err.message });
+    } catch {
       task.type = 'AntiTurnstileTaskProxyLess';
     }
-  } else {
-    logger.warn('No proxy provided — using ProxyLess Turnstile (may fail due to IP mismatch)');
   }
 
   const taskId = await createTask(task);
@@ -190,4 +230,4 @@ function detectChallenge(rawBody) {
   return /just a moment|cf-turnstile|turnstile\.cloudflare\.com|checking your browser/i.test(rawBody);
 }
 
-module.exports = { solveTurnstile, detectChallenge, extractSiteKeyFromBody };
+module.exports = { solveTurnstile, solveClearance, detectChallenge, extractSiteKeyFromBody };
