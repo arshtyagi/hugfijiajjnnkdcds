@@ -10,7 +10,7 @@
 
 const { Session, ClientIdentifier, initTLS } = require('node-tls-client');
 const { waitForOtp }                          = require('./imapOtp');
-const { solveTurnstile, solveClearance, detectChallenge } = require('./captchaSolver');
+const { detectChallenge } = require('./captchaSolver');
 const logger                                  = require('./utils/logger');
 
 const APOLLO_HOST = process.env.APOLLO_HOST || 'https://app.apollo.io';
@@ -37,76 +37,48 @@ async function createTlsSession(proxyUrl = null) {
 
 function getEpochTimestamp() { return Date.now().toString(); }
 
-function defaultHeaders(cookieStr = '', turnstileToken = null) {
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+function defaultHeaders(cookieStr = '') {
   const h = {
-    'accept':             '*/*',
-    'accept-language':    'es-ES,es;q=0.9,en;q=0.8,de;q=0.7,sr;q=0.6',
+    'accept':             'application/json, text/plain, */*',
+    'accept-language':    'en-US,en;q=0.9',
     'cache-control':      'no-cache',
     'content-type':       'application/json',
     'origin':             'https://app.apollo.io',
     'pragma':             'no-cache',
-    'priority':           'u=1, i',
     'referer':            'https://app.apollo.io/',
-    'sec-ch-ua':          '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+    'sec-ch-ua':          '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
     'sec-ch-ua-mobile':   '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest':     'empty',
     'sec-fetch-mode':     'cors',
     'sec-fetch-site':     'same-origin',
-    'user-agent':         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+    'user-agent':         UA,
   };
-  if (cookieStr)      h['cookie']               = cookieStr;
-  if (turnstileToken) h['cf-turnstile-response'] = turnstileToken;
+  if (cookieStr) h['cookie'] = cookieStr;
   return h;
 }
 
 /**
- * POST via TLS session.
- * On Cloudflare challenge (403 or challenge body), extracts site key from the
- * challenge response, solves Turnstile, and retries with the token.
+ * POST via TLS session with retry on transient errors.
  */
-async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxRetries = 5) {
+async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxRetries = 3) {
   let lastErr;
-  let turnstileToken  = null;
-  let lastChallengeBody = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const resp    = await sess.post(url, {
-        headers: defaultHeaders(cookieStr, turnstileToken),
+      const resp = await sess.post(url, {
+        headers: defaultHeaders(cookieStr),
         body:    JSON.stringify(bodyObj),
       });
 
       const rawBody = resp.body ?? '';
 
-      // Cloudflare JS challenge detected ("Just a moment...")
-      // Need cf_clearance cookie, not a Turnstile token
       if (resp.status === 403 || detectChallenge(rawBody)) {
-        lastChallengeBody = rawBody;
-
-        logger.info('Cloudflare JS challenge detected — getting cf_clearance', { attempt });
-
-        if (!proxyUrl) {
-          throw new Error('Cloudflare challenge requires a proxy — cannot solve without one');
-        }
-
-        try {
-          const cfClearance = await solveClearance(proxyUrl);
-          // Inject cf_clearance into the cookie string for next request
-          cookieStr = cookieStr
-            ? cookieStr.replace(/cf_clearance=[^;]+;?\s*/g, '') + `; cf_clearance=${cfClearance}`
-            : `cf_clearance=${cfClearance}`;
-          logger.info('cf_clearance obtained — retrying request');
-          continue;
-        } catch (clearanceErr) {
-          logger.warn('AntiCloudflareTask failed — falling back to Turnstile solve', { err: clearanceErr.message });
-          // Fallback: try Turnstile token approach
-          if (!turnstileToken) {
-            turnstileToken = await solveTurnstile(proxyUrl, lastChallengeBody).catch(() => null);
-            if (turnstileToken) continue;
-          }
-          throw clearanceErr;
-        }
+        logger.warn('Cloudflare challenge on attempt — waiting before retry', { attempt });
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+        continue;
       }
 
       return {
@@ -121,7 +93,7 @@ async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxR
       await new Promise(r => setTimeout(r, 1000 * attempt));
     }
   }
-  throw lastErr ?? new Error('Max retries exceeded');
+  throw lastErr ?? new Error('Cloudflare challenge — rotate proxy or try again later');
 }
 
 // ─── Cookie jar ───────────────────────────────────────────────────────────────
