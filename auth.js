@@ -1,18 +1,17 @@
 'use strict';
 
 /**
- * auth.js — Apollo login with bogdanfinn TLS fingerprint spoofing.
+ * auth.js — Apollo login with TLS fingerprinting + Cloudflare Turnstile solving.
  *
- * Fixes vs previous version:
- *   - initiate_email_verification 401/non-200 now throws immediately
- *     instead of proceeding to wait for an OTP that was never sent
- *   - waitForOtp no longer does recipient matching (afterDate + usedUids
- *     is sufficient — see imapOtp.js)
+ * When Cloudflare returns a 403/Turnstile challenge on login, we:
+ *   1. Solve the Turnstile via CapSolver
+ *   2. Retry the login request with the token in the headers
  */
 
 const { Session, ClientIdentifier, initTLS } = require('node-tls-client');
-const { waitForOtp } = require('./imapOtp');
-const logger         = require('./utils/logger');
+const { waitForOtp }                          = require('./imapOtp');
+const { solveTurnstile, detectChallenge }     = require('./captchaSolver');
+const logger                                  = require('./utils/logger');
 
 const APOLLO_HOST = process.env.APOLLO_HOST || 'https://app.apollo.io';
 
@@ -38,7 +37,7 @@ async function createTlsSession(proxyUrl = null) {
 
 function getEpochTimestamp() { return Date.now().toString(); }
 
-function defaultHeaders(cookieStr = '') {
+function defaultHeaders(cookieStr = '', turnstileToken = null) {
   const h = {
     'accept':             '*/*',
     'accept-language':    'es-ES,es;q=0.9,en;q=0.8,de;q=0.7,sr;q=0.6',
@@ -56,23 +55,46 @@ function defaultHeaders(cookieStr = '') {
     'sec-fetch-site':     'same-origin',
     'user-agent':         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
   };
-  if (cookieStr) h['cookie'] = cookieStr;
+  if (cookieStr)      h['cookie']                    = cookieStr;
+  if (turnstileToken) h['cf-turnstile-response']     = turnstileToken;
   return h;
 }
 
-async function tlsPost(sess, url, bodyObj, cookieStr = '', maxRetries = 5) {
+/**
+ * POST via TLS session.
+ * On Cloudflare challenge (403 or challenge body), solve Turnstile and retry once.
+ */
+async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxRetries = 5) {
   let lastErr;
+  let turnstileToken = null;
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const resp = await sess.post(url, {
-        headers: defaultHeaders(cookieStr),
+        headers: defaultHeaders(cookieStr, turnstileToken),
         body:    JSON.stringify(bodyObj),
       });
+
+      const rawBody = resp.body ?? '';
+
+      // Cloudflare challenge detected
+      if (resp.status === 403 || detectChallenge(rawBody)) {
+        if (turnstileToken) {
+          // Already tried with a token — token may be expired, get a new one
+          logger.warn('Turnstile token rejected — solving again', { attempt });
+          turnstileToken = null;
+        }
+        logger.info('Cloudflare challenge detected — solving Turnstile', { attempt });
+        turnstileToken = await solveTurnstile(proxyUrl);
+        logger.info('Turnstile solved — retrying request');
+        continue; // retry with token
+      }
+
       return {
         status:  resp.status,
         cookies: resp.cookies ?? {},
-        body:    (() => { try { return JSON.parse(resp.body); } catch { return null; } })(),
-        rawBody: resp.body ?? '',
+        body:    (() => { try { return JSON.parse(rawBody); } catch { return null; } })(),
+        rawBody,
       };
     } catch (err) {
       lastErr = err;
@@ -80,7 +102,7 @@ async function tlsPost(sess, url, bodyObj, cookieStr = '', maxRetries = 5) {
       await new Promise(r => setTimeout(r, 1000 * attempt));
     }
   }
-  throw lastErr;
+  throw lastErr ?? new Error('Max retries exceeded');
 }
 
 // ─── Cookie jar ───────────────────────────────────────────────────────────────
@@ -107,7 +129,7 @@ class CookieJar {
 async function loginToApollo(account) {
   const { email, password, accountId, proxy = null } = account;
 
-  logger.info('Starting Apollo login (TLS fingerprinted)', {
+  logger.info('Starting Apollo login (TLS + Turnstile)', {
     accountId,
     email,
     proxy: proxy ? proxy.replace(/\/\/[^@]*@/, '//***@') : 'direct',
@@ -122,13 +144,11 @@ async function loginToApollo(account) {
     'https://app.apollo.io/api/v1/auth/login',
     { cacheKey: getEpochTimestamp(), email, password, timezone_offset: '-120' },
     jar.toString(),
+    proxy,
   );
   jar.ingestObj(loginResp.cookies);
   logger.info('Login response', { accountId, status: loginResp.status });
 
-  if (typeof loginResp.rawBody === 'string' && loginResp.rawBody.includes('Just a moment')) {
-    throw new Error('Cloudflare challenge detected — rotate proxy');
-  }
   if (loginResp.status === 429) throw new Error('Rate-limited — rotate proxy / IP');
   if (!loginResp.body)          throw new Error('Failed to parse login response');
 
@@ -151,7 +171,6 @@ async function loginToApollo(account) {
     loginToken = r0.login_token || '';
     cacheKey   = getEpochTimestamp();
 
-    // Timestamp captured BEFORE initiation so we only accept emails after this point
     const otpAfterDate = new Date();
 
     const initResp = await tlsPost(
@@ -159,16 +178,15 @@ async function loginToApollo(account) {
       'https://app.apollo.io/api/v1/auth/initiate_email_verification',
       { cacheKey, login_token: loginToken },
       jar.toString(),
+      proxy,
     );
     jar.ingestObj(initResp.cookies);
 
-    // ── If initiation failed, throw now — don't wait for an OTP that won't come
     if (initResp.status !== 200) {
-      throw new Error(`initiate_email_verification failed with HTTP ${initResp.status} — login_token may be expired, retrying full login`);
+      throw new Error(`initiate_email_verification failed with HTTP ${initResp.status} — retrying full login`);
     }
     logger.info('Email verification initiated', { accountId, status: initResp.status });
 
-    logger.info('Waiting for OTP', { accountId, email });
     const otp = await waitForOtp(email, otpAfterDate);
     logger.info('OTP received — submitting', { accountId });
 
@@ -177,6 +195,7 @@ async function loginToApollo(account) {
       'https://app.apollo.io/api/v1/auth/verify_email',
       { otp, login_token: loginToken, cacheKey },
       jar.toString(),
+      proxy,
     );
     jar.ingestObj(verifyResp.cookies);
 
@@ -205,12 +224,11 @@ async function loginToApollo(account) {
       'https://app.apollo.io/api/v1/auth/initiate_email_verification',
       { cacheKey, login_token: loginToken },
       jar.toString(),
+      proxy,
     );
     jar.ingestObj(ir.cookies);
 
-    if (ir.status !== 200) {
-      throw new Error(`initiate_email_verification retry failed with HTTP ${ir.status}`);
-    }
+    if (ir.status !== 200) throw new Error(`initiate_email_verification retry failed with HTTP ${ir.status}`);
 
     const otp2 = await waitForOtp(email, retryOtpAfterDate);
     logger.info('Retry OTP received', { accountId });
@@ -220,6 +238,7 @@ async function loginToApollo(account) {
       'https://app.apollo.io/api/v1/auth/verify_email',
       { otp: otp2, login_token: loginToken, cacheKey },
       jar.toString(),
+      proxy,
     );
     jar.ingestObj(vr.cookies);
 
