@@ -152,9 +152,13 @@ async function solveClearance(proxyUrl = null) {
   });
 
   const task = {
-    type:         'AntiCloudflareTask',
-    websiteURL:   'https://app.apollo.io/api/v1/auth/login',
-    proxy:        `${proxyType}:${proxyLogin}:${proxyPassword}@${proxyAddress}:${proxyPort}`,
+    type:        'AntiCloudflareTask',
+    websiteURL:  'https://app.apollo.io/api/v1/auth/login',
+    proxyType:    proxyType,
+    proxyAddress: proxyAddress,
+    proxyPort:    proxyPort,
+    proxyLogin:   proxyLogin    || '',
+    proxyPassword: proxyPassword || '',
   };
 
   const taskId = await createTask(task);
