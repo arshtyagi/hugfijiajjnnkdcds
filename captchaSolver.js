@@ -125,7 +125,7 @@ async function pollForResult(taskId) {
  * @param {string|null} proxyUrl — proxy (required for AntiCloudflareTask)
  * @returns {Promise<string>} cf_clearance cookie value
  */
-async function solveClearance(proxyUrl = null) {
+async function solveClearance(proxyUrl = null, challengeHtml = null) {
   if (!CAPSOLVER_API_KEY) {
     throw new Error('CAPSOLVER_API_KEY not set — cannot solve Cloudflare challenge');
   }
@@ -140,8 +140,8 @@ async function solveClearance(proxyUrl = null) {
     proxyType     = u.protocol.replace(':', '');
     proxyAddress  = u.hostname;
     proxyPort     = Number(u.port);
-    proxyLogin    = u.username ? decodeURIComponent(u.username) : undefined;
-    proxyPassword = u.password ? decodeURIComponent(u.password) : undefined;
+    proxyLogin    = u.username ? decodeURIComponent(u.username) : '';
+    proxyPassword = u.password ? decodeURIComponent(u.password) : '';
   } catch (err) {
     throw new Error(`Failed to parse proxy URL: ${err.message}`);
   }
@@ -149,6 +149,7 @@ async function solveClearance(proxyUrl = null) {
   logger.info('Solving Cloudflare JS challenge via CapSolver AntiCloudflareTask', {
     proxyAddress,
     proxyPort,
+    hasHtml: !!challengeHtml,
   });
 
   const task = {
@@ -157,8 +158,9 @@ async function solveClearance(proxyUrl = null) {
     proxyType:    proxyType,
     proxyAddress: proxyAddress,
     proxyPort:    proxyPort,
-    proxyLogin:   proxyLogin    || '',
+    proxyLogin:    proxyLogin    || '',
     proxyPassword: proxyPassword || '',
+    html:          challengeHtml || '',
   };
 
   const taskId = await createTask(task);
