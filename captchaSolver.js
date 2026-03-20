@@ -125,7 +125,7 @@ async function pollForResult(taskId) {
  * @param {string|null} proxyUrl — proxy (required for AntiCloudflareTask)
  * @returns {Promise<string>} cf_clearance cookie value
  */
-async function solveClearance(proxyUrl = null, challengeHtml = null) {
+async function solveClearance(proxyUrl = null) {
   if (!CAPSOLVER_API_KEY) {
     throw new Error('CAPSOLVER_API_KEY not set — cannot solve Cloudflare challenge');
   }
@@ -149,19 +149,17 @@ async function solveClearance(proxyUrl = null, challengeHtml = null) {
   logger.info('Solving Cloudflare JS challenge via CapSolver AntiCloudflareTask', {
     proxyAddress,
     proxyPort,
-    hasHtml: !!challengeHtml,
+
   });
 
   const task = {
-    type:        'AntiCloudflareTask',
-    websiteURL:  'https://app.apollo.io/api/v1/auth/login',
+    type:         'AntiCloudflareTask',
+    websiteURL:   'https://app.apollo.io',
     proxyType:    proxyType,
     proxyAddress: proxyAddress,
     proxyPort:    proxyPort,
-    proxyLogin:    proxyLogin    || '',
+    proxyLogin:   proxyLogin    || '',
     proxyPassword: proxyPassword || '',
-    html:          challengeHtml || '',
-    userAgent:     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
   };
 
   const taskId = await createTask(task);
