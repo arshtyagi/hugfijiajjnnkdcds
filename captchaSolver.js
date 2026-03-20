@@ -2,16 +2,62 @@
 
 /**
  * captchaSolver.js
- * Solves Cloudflare Turnstile challenges via CapSolver API.
+ *
+ * Solves Cloudflare Turnstile for Apollo login.
+ *
+ * Site key extraction strategy (in order):
+ *   1. Extract from the challenge response body itself — the Turnstile iframe
+ *      URL contains the site key e.g. /turnstile/.../0x4AAAA.../
+ *   2. Fall back to APOLLO_TURNSTILE_SITE_KEY env var
+ *
+ * This is the most reliable approach since the key is always present in
+ * the very response that triggered the solve.
  */
 
-const https = require('https');
+const https  = require('https');
 const logger = require('./utils/logger');
 
-const CAPSOLVER_API_KEY   = process.env.CAPSOLVER_API_KEY;
-const APOLLO_TURNSTILE_KEY = process.env.APOLLO_TURNSTILE_SITE_KEY || '0x4AAAAAAABkMYinukE8nzYS';
-const POLL_INTERVAL_MS    = 3_000;
-const MAX_WAIT_MS         = 120_000;
+const CAPSOLVER_API_KEY  = process.env.CAPSOLVER_API_KEY;
+const FALLBACK_SITE_KEY  = process.env.APOLLO_TURNSTILE_SITE_KEY || '0x4AAAAAABI5GqZtId4RpSvo';
+const POLL_INTERVAL_MS   = 3_000;
+const MAX_WAIT_MS        = 120_000;
+
+// ─── Site key extraction ──────────────────────────────────────────────────────
+
+/**
+ * Extract Turnstile site key from a Cloudflare challenge response body.
+ * The key appears in the Turnstile iframe src URL embedded in the HTML.
+ *
+ * Patterns found in real CF challenge pages:
+ *   /turnstile/f/ov2/av0/rch/.../0x4AAAAAABI5GqZtId4RpSvo/...
+ *   data-sitekey="0x4AAAAAABI5GqZtId4RpSvo"
+ *   sitekey: "0x4AAAAAABI5GqZtId4RpSvo"
+ */
+function extractSiteKeyFromBody(body) {
+  if (!body || typeof body !== 'string') return null;
+
+  const patterns = [
+    // Turnstile iframe URL path — most reliable
+    /\/turnstile\/[^/]*\/[^/]*\/[^/]*\/[^/]*\/(0x4[A-Za-z0-9_-]{8,50})\//,
+    // data-sitekey attribute
+    /data-sitekey=["'](0x4[A-Za-z0-9_-]{8,50})["']/i,
+    // JS object key
+    /sitekey["'\s]*:["'\s]*(0x4[A-Za-z0-9_-]{8,50})/i,
+    // websiteKey
+    /websiteKey["'\s]*:["'\s]*(0x4[A-Za-z0-9_-]{8,50})/i,
+    // Any quoted 0x4... string
+    /"(0x4[A-Za-z0-9_-]{10,50})"/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = body.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+
+  return null;
+}
+
+// ─── CapSolver helpers ────────────────────────────────────────────────────────
 
 function capsolverPost(path, body) {
   return new Promise((resolve, reject) => {
@@ -70,36 +116,50 @@ async function pollForResult(taskId) {
   throw new Error(`CapSolver timeout after ${MAX_WAIT_MS}ms`);
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 /**
- * Solve Cloudflare Turnstile for Apollo login page.
- * Returns the cfTurnstileResponse token.
+ * Solve Cloudflare Turnstile.
+ *
+ * @param {string|null} proxyUrl      — proxy to use for the solve task
+ * @param {string|null} challengeBody — the raw challenge response body (used to extract site key)
+ * @returns {Promise<string>} cfTurnstileResponse token
  */
-async function solveTurnstile(proxyUrl = null) {
+async function solveTurnstile(proxyUrl = null, challengeBody = null) {
   if (!CAPSOLVER_API_KEY) {
     throw new Error('CAPSOLVER_API_KEY not set — cannot solve Turnstile');
   }
 
-  logger.info('Solving Cloudflare Turnstile via CapSolver', { siteKey: APOLLO_TURNSTILE_KEY });
+  // Try to extract key from the challenge body first
+  let siteKey = extractSiteKeyFromBody(challengeBody);
+
+  if (siteKey) {
+    logger.info('Turnstile site key extracted from challenge body', { siteKey });
+  } else {
+    siteKey = FALLBACK_SITE_KEY;
+    logger.info('Using fallback Turnstile site key', { siteKey });
+  }
+
+  logger.info('Solving Cloudflare Turnstile via CapSolver', { siteKey });
 
   const task = {
     type:        'AntiTurnstileTaskProxyLess',
     websiteURL:  'https://app.apollo.io',
-    websiteKey:  APOLLO_TURNSTILE_KEY,
+    websiteKey:  siteKey,
     metadata:    { action: 'managed' },
   };
 
-  // If proxy is provided use proxy-based task for better success rate
+  // Use proxy-based task if proxy is available (better success rate)
   if (proxyUrl) {
     try {
       const u = new URL(proxyUrl);
-      task.type       = 'AntiTurnstileTask';
-      task.proxyType  = u.protocol.replace(':', '');
-      task.proxyAddress = u.hostname;
-      task.proxyPort  = Number(u.port);
+      task.type          = 'AntiTurnstileTask';
+      task.proxyType     = u.protocol.replace(':', '');
+      task.proxyAddress  = u.hostname;
+      task.proxyPort     = Number(u.port);
       if (u.username) task.proxyLogin    = decodeURIComponent(u.username);
       if (u.password) task.proxyPassword = decodeURIComponent(u.password);
     } catch {
-      // fallback to proxyless if URL parse fails
       task.type = 'AntiTurnstileTaskProxyLess';
     }
   }
@@ -116,4 +176,4 @@ function detectChallenge(rawBody) {
   return /just a moment|cf-turnstile|turnstile\.cloudflare\.com|checking your browser/i.test(rawBody);
 }
 
-module.exports = { solveTurnstile, detectChallenge };
+module.exports = { solveTurnstile, detectChallenge, extractSiteKeyFromBody };
