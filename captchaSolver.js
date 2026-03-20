@@ -136,6 +136,12 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
   if (siteKey) {
     logger.info('Turnstile site key extracted from challenge body', { siteKey });
   } else {
+    // Log what we got so we can improve extraction if needed
+    if (challengeBody) {
+      logger.info('Could not extract site key from body', {
+        bodySnippet: String(challengeBody).slice(0, 200),
+      });
+    }
     siteKey = FALLBACK_SITE_KEY;
     logger.info('Using fallback Turnstile site key', { siteKey });
   }
@@ -149,7 +155,7 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
     metadata:    { action: 'managed' },
   };
 
-  // Use proxy-based task if proxy is available (better success rate)
+  // Always try proxy-based task when proxy is provided — IP must match
   if (proxyUrl) {
     try {
       const u = new URL(proxyUrl);
@@ -159,9 +165,17 @@ async function solveTurnstile(proxyUrl = null, challengeBody = null) {
       task.proxyPort     = Number(u.port);
       if (u.username) task.proxyLogin    = decodeURIComponent(u.username);
       if (u.password) task.proxyPassword = decodeURIComponent(u.password);
-    } catch {
+      logger.info('Using proxy-based Turnstile task', {
+        proxyAddress: task.proxyAddress,
+        proxyPort:    task.proxyPort,
+        hasLogin:     !!task.proxyLogin,
+      });
+    } catch (err) {
+      logger.warn('Failed to parse proxy URL for Turnstile — using ProxyLess (IP mismatch risk)', { err: err.message });
       task.type = 'AntiTurnstileTaskProxyLess';
     }
+  } else {
+    logger.warn('No proxy provided — using ProxyLess Turnstile (may fail due to IP mismatch)');
   }
 
   const taskId = await createTask(task);
