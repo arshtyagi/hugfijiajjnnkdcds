@@ -3,10 +3,9 @@
 /**
  * imapOtp.js
  *
- * CRITICAL FIX: cleanup is now completely fire-and-forget.
- * The OTP is returned immediately after being found — the inbox
- * cleanup happens in the background on a separate IMAP connection
- * so it never delays the verify_email call.
+ * Key fix: IMAP `SINCE` only filters by DATE (not time), so emails from
+ * earlier in the same day pass the filter even if they predate afterDate.
+ * We now fetch the envelope and check the EXACT received time against afterDate.
  */
 
 const { ImapFlow } = require('imapflow');
@@ -24,7 +23,6 @@ const IMAP_CONFIG = {
   tls: { rejectUnauthorized: true },
 };
 
-// 'archive' | 'delete' | 'trash'
 const IMAP_ACTION      = (process.env.IMAP_ACTION || 'archive').toLowerCase();
 const CLEANUP_AFTER_MS = Number(process.env.IMAP_CLEANUP_AFTER_MS) || 10 * 60 * 1000;
 
@@ -45,7 +43,7 @@ function extractOtp(text) {
   return null;
 }
 
-// Global UID dedup
+// Global UID dedup — once consumed, never returned again
 const _usedUids = new Set();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,10 +66,8 @@ async function waitForOtp(apolloEmail, afterDate, timeoutMs = 90_000, pollInterv
     const result = await _fetchOtp(afterDate);
     if (result) {
       logger.info('OTP received successfully', { apolloEmail });
-
-      // ── Fire-and-forget cleanup — does NOT block OTP return ──────────────
+      // Fire-and-forget cleanup — never blocks OTP return
       _backgroundCleanup(result.disposeUids).catch(() => {});
-
       return result.otp;
     }
     await new Promise(r => setTimeout(r, pollIntervalMs));
@@ -81,7 +77,7 @@ async function waitForOtp(apolloEmail, afterDate, timeoutMs = 90_000, pollInterv
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Fetch OTP — returns immediately once found, collects UIDs to dispose
+//  Fetch — returns OTP immediately, collects UIDs for background disposal
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function _fetchOtp(afterDate) {
@@ -91,8 +87,13 @@ async function _fetchOtp(afterDate) {
     await client.connect();
     await client.mailboxOpen('INBOX');
 
+    // IMAP SINCE only matches by date — we use start-of-day to cast a wide net
+    // then filter by exact time ourselves using the envelope date
+    const sinceDay = new Date(afterDate);
+    sinceDay.setHours(0, 0, 0, 0);
+
     const uids = await client.search({
-      since: afterDate,
+      since: sinceDay,
       or: [
         { from: 'apollo.io' },
         { subject: 'verification' },
@@ -103,16 +104,30 @@ async function _fetchOtp(afterDate) {
 
     if (!uids?.length) return null;
 
+    // Newest first, skip already-consumed UIDs
     const candidates = [...uids]
       .sort((a, b) => b - a)
       .filter(uid => !_usedUids.has(uid));
 
     if (!candidates.length) return null;
 
-    for (const uid of candidates.slice(0, 10)) {
+    for (const uid of candidates.slice(0, 20)) {
       try {
-        const msg = await client.fetchOne(uid, { source: true });
+        const msg = await client.fetchOne(uid, { envelope: true, source: true });
         if (!msg) continue;
+
+        // ── EXACT TIME CHECK — this is the key fix ──────────────────────────
+        // IMAP SINCE matches the whole day, so we must check the exact time
+        // to reject emails that arrived before initiate_email_verification
+        const emailDate = msg.envelope?.date ? new Date(msg.envelope.date) : null;
+        if (emailDate && emailDate < afterDate) {
+          logger.info('Skipping email — arrived before afterDate', {
+            uid,
+            emailDate: emailDate.toISOString(),
+            afterDate: afterDate.toISOString(),
+          });
+          continue;
+        }
 
         const rawBody = msg.source?.toString('utf8') ?? '';
         const otp     = extractOtp(rawBody);
@@ -120,11 +135,13 @@ async function _fetchOtp(afterDate) {
 
         // Mark consumed immediately
         _usedUids.add(uid);
-        logger.info(`OTP found (uid ${uid}) — cleanup scheduled in background`);
+        logger.info(`OTP found uid ${uid} at ${emailDate?.toISOString()} — cleanup scheduled`);
 
-        // Collect other Apollo emails to clean up too (already filtered by afterDate)
-        const disposeUids = candidates.filter(u => u !== uid).slice(0, 50);
-        disposeUids.unshift(uid); // OTP email first
+        // Collect sibling emails to dispose too
+        const disposeUids = candidates
+          .filter(u => u !== uid && !_usedUids.has(u))
+          .slice(0, 50);
+        disposeUids.unshift(uid);
 
         return { otp, disposeUids };
 
@@ -143,11 +160,11 @@ async function _fetchOtp(afterDate) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Background cleanup — runs on a fresh connection, never blocks the caller
+//  Background cleanup — separate connection, never blocks caller
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function _backgroundCleanup(hotUids = []) {
-  // Small delay so the verify_email request has time to complete first
+  // Small delay so verify_email completes before we archive
   await new Promise(r => setTimeout(r, 3000));
 
   const client = new ImapFlow(IMAP_CONFIG);
@@ -156,11 +173,10 @@ async function _backgroundCleanup(hotUids = []) {
     await client.connect();
     await client.mailboxOpen('INBOX');
 
-    // 1. Dispose the hot UIDs (OTP email + sibling emails from the same poll)
-    const freshHot = hotUids.filter(uid => !_usedUids.has(uid) || hotUids[0] === uid);
-    if (freshHot.length) {
-      freshHot.forEach(uid => _usedUids.add(uid));
-      await _disposeUids(client, freshHot);
+    // 1. Dispose hot UIDs (the OTP email + siblings from same poll)
+    if (hotUids.length) {
+      hotUids.forEach(uid => _usedUids.add(uid));
+      await _disposeUids(client, hotUids);
     }
 
     // 2. Clean up old Apollo emails (older than CLEANUP_AFTER_MS)
@@ -180,7 +196,6 @@ async function _backgroundCleanup(hotUids = []) {
       if (toClean.length) {
         logger.info(`Background cleanup: disposing ${toClean.length} old email(s)`);
         toClean.forEach(uid => _usedUids.add(uid));
-        // Process in batches of 200 to avoid huge IMAP commands
         for (let i = 0; i < toClean.length; i += 200) {
           await _disposeUids(client, toClean.slice(i, i + 200));
         }
