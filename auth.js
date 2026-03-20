@@ -3,9 +3,9 @@
 /**
  * auth.js — Apollo login with TLS fingerprinting + Cloudflare Turnstile solving.
  *
- * When Cloudflare returns a 403/Turnstile challenge on login, we:
- *   1. Solve the Turnstile via CapSolver
- *   2. Retry the login request with the token in the headers
+ * When Cloudflare returns a 403/Turnstile challenge, we pass the raw response
+ * body to solveTurnstile() which extracts the site key directly from it.
+ * No separate page fetch needed — the key is always in the challenge response.
  */
 
 const { Session, ClientIdentifier, initTLS } = require('node-tls-client');
@@ -55,22 +55,24 @@ function defaultHeaders(cookieStr = '', turnstileToken = null) {
     'sec-fetch-site':     'same-origin',
     'user-agent':         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
   };
-  if (cookieStr)      h['cookie']                    = cookieStr;
-  if (turnstileToken) h['cf-turnstile-response']     = turnstileToken;
+  if (cookieStr)      h['cookie']               = cookieStr;
+  if (turnstileToken) h['cf-turnstile-response'] = turnstileToken;
   return h;
 }
 
 /**
  * POST via TLS session.
- * On Cloudflare challenge (403 or challenge body), solve Turnstile and retry once.
+ * On Cloudflare challenge (403 or challenge body), extracts site key from the
+ * challenge response, solves Turnstile, and retries with the token.
  */
 async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxRetries = 5) {
   let lastErr;
-  let turnstileToken = null;
+  let turnstileToken  = null;
+  let lastChallengeBody = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const resp = await sess.post(url, {
+      const resp    = await sess.post(url, {
         headers: defaultHeaders(cookieStr, turnstileToken),
         body:    JSON.stringify(bodyObj),
       });
@@ -79,15 +81,19 @@ async function tlsPost(sess, url, bodyObj, cookieStr = '', proxyUrl = null, maxR
 
       // Cloudflare challenge detected
       if (resp.status === 403 || detectChallenge(rawBody)) {
+        lastChallengeBody = rawBody; // keep for key extraction
+
         if (turnstileToken) {
-          // Already tried with a token — token may be expired, get a new one
-          logger.warn('Turnstile token rejected — solving again', { attempt });
+          logger.warn('Turnstile token rejected — solving again with fresh key', { attempt });
           turnstileToken = null;
         }
+
         logger.info('Cloudflare challenge detected — solving Turnstile', { attempt });
-        turnstileToken = await solveTurnstile(proxyUrl);
+
+        // Pass the challenge body so the solver can extract the site key from it
+        turnstileToken = await solveTurnstile(proxyUrl, lastChallengeBody);
         logger.info('Turnstile solved — retrying request');
-        continue; // retry with token
+        continue;
       }
 
       return {
